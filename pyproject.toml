@@ -1,0 +1,9 @@
+[project]
+name = "homelab-watch"
+version = "0.1.0"
+description = "自宅 Ubuntu Server 監視 AI エージェント"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
