@@ -1,9 +1,8 @@
-"""homelab-watch MCP サーバー (Week 2 拡張版)。
+"""homelab-watch MCP サーバー。
 
-過去 N 時間の SSH ログイン失敗を集計する read-only ツールを提供する。
-- /var/log/auth.log とローテートファイル (auth.log.1, auth.log.2.gz, ...) を横断して読む
-- 年跨ぎ timestamp は now を基準に前年判定 (clock skew 1 日許容)
-- 発信元 IP は CLAUDE.md 規約に従い /24 にマスキング
+提供する read-only ツール:
+- get_ssh_failures: auth.log + ローテートから過去 N 時間の SSH 失敗を集計 (/24 マスク)
+- get_system_status: CPU / load / memory / disk / 主要サービス状態を返す
 """
 from __future__ import annotations
 
@@ -11,10 +10,14 @@ import gzip
 import logging
 import os
 import re
+import shutil
+import subprocess
+import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import psutil
 from fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
@@ -173,6 +176,103 @@ def get_ssh_failures(hours: int = 24) -> dict:
         top_source_subnets, parse_errors, files_read)。
     """
     return _compute_ssh_failures(hours)
+
+
+# --- get_system_status -------------------------------------------------
+
+
+DEFAULT_SERVICES: tuple[str, ...] = (
+    "ssh",
+    "ufw",
+    "fail2ban",
+    "systemd-timesyncd",
+)
+_GB = 1024 ** 3
+
+
+def _systemctl_is_active(service: str, timeout: float = 5.0) -> str:
+    """systemctl is-active <service> の出力を返す。
+
+    systemctl 不在・タイムアウト・OS エラーは 'unknown' にフォールバック。
+    sudo は不要 (is-active は read-only な status クエリ)。
+    """
+    if shutil.which("systemctl") is None:
+        return "unknown"
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", service],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
+def _compute_system_status(
+    services: tuple[str, ...] | list[str] = DEFAULT_SERVICES,
+) -> dict:
+    """CPU / load / memory / disk / 主要サービスの稼働状態を集めて返す純関数。
+
+    hostname / IP / ユーザー情報は返さない (CLAUDE.md「実 IP/ホスト名」保護方針)。
+    cpu_percent は 0.5 秒サンプリング。それ以外は瞬時値。
+    """
+    logger.info("system_status start: services=%s", list(services))
+
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    disk = psutil.disk_usage("/")
+    load1, load5, load15 = psutil.getloadavg()
+    uptime_sec = int(time.time() - psutil.boot_time())
+
+    result = {
+        "cpu_percent": psutil.cpu_percent(interval=0.5),
+        "load_average": {
+            "1m": round(load1, 2),
+            "5m": round(load5, 2),
+            "15m": round(load15, 2),
+        },
+        "memory": {
+            "total_gb": round(mem.total / _GB, 2),
+            "used_gb": round(mem.used / _GB, 2),
+            "available_gb": round(mem.available / _GB, 2),
+            "percent": mem.percent,
+        },
+        "swap": {
+            "total_gb": round(swap.total / _GB, 2),
+            "used_gb": round(swap.used / _GB, 2),
+            "percent": swap.percent,
+        },
+        "disk_root": {
+            "total_gb": round(disk.total / _GB, 2),
+            "used_gb": round(disk.used / _GB, 2),
+            "free_gb": round(disk.free / _GB, 2),
+            "percent": disk.percent,
+        },
+        "uptime_seconds": uptime_sec,
+        "services": {s: _systemctl_is_active(s) for s in services},
+    }
+    logger.info(
+        "system_status done: cpu=%s%% mem=%s%% disk=%s%% uptime=%ss services=%s",
+        result["cpu_percent"], result["memory"]["percent"],
+        result["disk_root"]["percent"], uptime_sec, result["services"],
+    )
+    return result
+
+
+@mcp.tool
+def get_system_status(services: list[str] | None = None) -> dict:
+    """システムの現在状態 (read-only) を返す。
+
+    Args:
+        services: 状態を確認する systemd ユニット名のリスト。
+                  None なら ['ssh', 'ufw', 'fail2ban', 'systemd-timesyncd']。
+
+    Returns:
+        CPU / load / memory / swap / disk(/) / uptime / services の dict。
+    """
+    return _compute_system_status(services or DEFAULT_SERVICES)
 
 
 if __name__ == "__main__":
