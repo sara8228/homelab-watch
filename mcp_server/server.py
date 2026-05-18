@@ -3,6 +3,7 @@
 提供する read-only ツール:
 - get_ssh_failures: auth.log + ローテートから過去 N 時間の SSH 失敗を集計 (/24 マスク)
 - get_system_status: CPU / load / memory / disk / 主要サービス状態を返す
+- get_pending_updates: apt の更新可能パッケージサマリ (security/kernel フラグ付き)
 """
 from __future__ import annotations
 
@@ -273,6 +274,144 @@ def get_system_status(services: list[str] | None = None) -> dict:
         CPU / load / memory / swap / disk(/) / uptime / services の dict。
     """
     return _compute_system_status(services or DEFAULT_SERVICES)
+
+
+# --- get_pending_updates -----------------------------------------------
+
+
+APT_CACHE_PATH = Path("/var/cache/apt/pkgcache.bin")
+
+_KERNEL_NON_KERNEL_PACKAGES = frozenset({
+    # `linux-*` を名前に含むが、カーネルそのものではないパッケージ
+    "linux-libc-dev",  # ユーザ空間用 libc kernel headers
+})
+
+
+def _is_kernel_package(name: str) -> bool:
+    """`linux-*` 系のパッケージを kernel 関連と見なす (一部の非 kernel を除外)。
+
+    対象例: linux-image-*, linux-modules-*, linux-headers-*, linux-generic,
+    linux-generic-hwe-24.04, linux-aws-*, linux-azure-* など。
+    """
+    if not name.startswith("linux-"):
+        return False
+    return name not in _KERNEL_NON_KERNEL_PACKAGES
+
+
+def _apt_cache_age_seconds(cache_path: Path = APT_CACHE_PATH) -> int | None:
+    """apt cache ファイルの mtime からの経過秒。ファイル不在なら None。"""
+    if not cache_path.exists():
+        return None
+    return int(time.time() - cache_path.stat().st_mtime)
+
+
+def _parse_apt_upgradable_line(line: str) -> dict | None:
+    """`apt list --upgradable` の 1 行をパースする。
+
+    フォーマット例 (apt は CLI 不安定を警告するが事実上の出力):
+        gcc-13/noble-updates 13.3.0-6ubuntu2~24.04.1 amd64 [upgradable from: 13.2.0-23ubuntu4]
+        libssl3t64/noble-security 3.0.13-0ubuntu3.5 amd64 [upgradable from: 3.0.13-0ubuntu3.4]
+
+    マッチしない行 (header, blank 等) は None を返す。
+    """
+    if "/" not in line or "[upgradable from:" not in line:
+        return None
+    parts = line.split()
+    if len(parts) < 4:
+        return None
+    name_source = parts[0]
+    new_version = parts[1]
+    arch = parts[2]
+    if "/" not in name_source:
+        return None
+    name, source = name_source.split("/", 1)
+    # "[upgradable from: <old>]" から old_version を取り出す
+    old_version: str | None = None
+    for i, tok in enumerate(parts):
+        if tok == "from:" and i + 1 < len(parts):
+            old_version = parts[i + 1].rstrip("]")
+            break
+    return {
+        "name": name,
+        "source": source,
+        "new_version": new_version,
+        "arch": arch,
+        "old_version": old_version,
+        "is_security": "-security" in source,
+        "is_kernel": _is_kernel_package(name),
+    }
+
+
+def _list_upgradable_packages(
+    timeout: float = 30.0,
+) -> tuple[list[dict], str | None]:
+    """`apt list --upgradable` を実行してパース結果を返す。
+
+    Returns:
+        (packages, error_or_None)
+    """
+    if shutil.which("apt") is None:
+        return [], "apt command not found"
+    try:
+        result = subprocess.run(
+            ["apt", "list", "--upgradable"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return [], f"apt failed: {type(exc).__name__}"
+    pkgs: list[dict] = []
+    for line in result.stdout.splitlines():
+        parsed = _parse_apt_upgradable_line(line)
+        if parsed is not None:
+            pkgs.append(parsed)
+    return pkgs, None
+
+
+def _compute_pending_updates(
+    cache_path: Path = APT_CACHE_PATH,
+    sample_size: int = 20,
+) -> dict:
+    """更新可能パッケージを集計して dict で返す純関数。"""
+    logger.info("pending_updates start")
+    pkgs, error = _list_upgradable_packages()
+    if error:
+        logger.warning("pending_updates: apt error: %s", error)
+        return {"error": error, "total": 0, "cache_age_seconds": _apt_cache_age_seconds(cache_path)}
+
+    security = [p for p in pkgs if p["is_security"]]
+    kernel = [p for p in pkgs if p["is_kernel"]]
+    result = {
+        "cache_age_seconds": _apt_cache_age_seconds(cache_path),
+        "total": len(pkgs),
+        "security_count": len(security),
+        "kernel_count": len(kernel),
+        "kernel_update_needed": len(kernel) > 0,
+        "security_packages": [p["name"] for p in security[:sample_size]],
+        "kernel_packages": [p["name"] for p in kernel[:sample_size]],
+        "all_packages_sample": [p["name"] for p in pkgs[:sample_size]],
+    }
+    logger.info(
+        "pending_updates done: total=%d security=%d kernel=%d cache_age=%ss",
+        result["total"], result["security_count"], result["kernel_count"],
+        result["cache_age_seconds"],
+    )
+    return result
+
+
+@mcp.tool
+def get_pending_updates() -> dict:
+    """apt の更新可能パッケージサマリを返す (read-only)。
+
+    `apt list --upgradable` の出力を集計し、security update 数・kernel update
+    の有無・パッケージ名サンプルを返す。sudo は不要 (cache の読み取りのみ)。
+    cache が古い (`cache_age_seconds` 大) 場合は最新更新の取りこぼし可能性あり。
+
+    Returns:
+        total / security_count / kernel_update_needed / 各カテゴリの package サンプル等。
+    """
+    return _compute_pending_updates()
 
 
 if __name__ == "__main__":
