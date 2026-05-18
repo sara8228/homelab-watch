@@ -41,7 +41,7 @@ cd homelab-watch
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install "mcp[cli]" fastmcp pytest
+pip install "mcp[cli]" fastmcp psutil pytest pip-audit
 
 # 3. テスト
 pytest
