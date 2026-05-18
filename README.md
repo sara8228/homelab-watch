@@ -95,14 +95,16 @@ homelab-watch/
 ## 開発
 
 ```bash
-# テスト実行
-pytest -v
+# よく使うコマンド (Makefile 経由)
+make test    # pytest を実行
+make audit   # pip-audit で依存脆弱性スキャン
+make help    # ターゲット一覧
 
-# MCP サーバー単体起動 (stdio で待機。動作確認用)
-.venv/bin/python mcp_server/server.py
-
-# テスト用 auth.log で実行
-HOMELAB_WATCH_AUTH_LOG=/path/to/fake.log python -c "from mcp_server.server import _compute_ssh_failures; print(_compute_ssh_failures(24))"
+# 個別コマンド
+.venv/bin/pytest -v                            # テスト実行
+.venv/bin/python mcp_server/server.py          # MCP サーバー単体起動 (stdio で待機)
+HOMELAB_WATCH_AUTH_LOG=/path/to/fake.log \
+  .venv/bin/python -c "from mcp_server.server import _compute_ssh_failures; print(_compute_ssh_failures(24))"
 ```
 
 ## ライセンス
